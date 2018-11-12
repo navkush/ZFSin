@@ -845,7 +845,16 @@ int vnode_recycle_int(vnode_t *vp, int flags)
 		if (zfs_vnop_reclaim(vp))
 			panic("vnode_recycle: cannot reclaim\n"); // My fav panic from OSX
 
-		ASSERT3P(vp->fileobject, == , NULL);
+		// walk avl tree and decouple all fileobjects
+		FILE_OBJECT *fo = vnode_fileobject(vp, NULL);
+		while (fo) {
+			vnode_decouplefileobject(vp, fo);
+			fo = vnode_fileobject(vp, NULL);
+		}
+		ASSERT(avl_is_empty(&vp->fileobjects));
+		avl_destroy(&vp->fileobjects);
+
+//		ASSERT3P(vp->fileobject, == , NULL);
 
 		mutex_enter(&vnode_all_list_lock);
 		list_remove(&vnode_all_list, vp);
@@ -874,6 +883,25 @@ int vnode_recycle(vnode_t *vp)
 	return vnode_recycle_int(vp, 0);
 }
 
+
+int compare_fileobjects(const void* fo1, const void* fo2) {
+	if ((uintptr_t)fo1 > (uintptr_t)fo2)
+		return 1;
+	else if ((uintptr_t)fo1 < (uintptr_t)fo2)
+		return -1;
+	return 0;
+}
+
+
+
+struct fileobject_tree_elem {
+	FILE_OBJECT *fp;
+	avl_node_t list_link;
+};
+
+
+typedef struct fileobject_tree_elem fo_tree_elem;
+
 void vnode_create(mount_t *mp, void *v_data, int type, int flags, struct vnode **vpp)
 {
 	*vpp = kmem_zalloc(sizeof(**vpp), KM_SLEEP);  // FIXME Change me to kmem_cache
@@ -886,6 +914,13 @@ void vnode_create(mount_t *mp, void *v_data, int type, int flags, struct vnode *
 	atomic_inc_64(&vnode_active);
 	if (flags & VNODE_MARKROOT)
 		(*vpp)->v_flags |= VNODE_MARKROOT;
+
+	avl_create(
+		&((*vpp)->fileobjects), 
+		compare_fileobjects, 
+		sizeof(fo_tree_elem),
+		offsetof(fo_tree_elem, list_link)
+	);
 
 	mutex_enter(&vnode_all_list_lock);
 	list_insert_tail(&vnode_all_list, *vpp);
@@ -1065,32 +1100,114 @@ void *vnode_security(vnode_t *vp)
 	return vp->security_descriptor;
 }
 
-void vnode_setfileobject(vnode_t *vp, FILE_OBJECT *fileobject)
+/*
+* Remove fileobject from vp->fileobjects and destroy fo_tree_elem
+*/
+void vnode_removefileobject(vnode_t *vp, FILE_OBJECT *fileobject)
 {
-	if (vp) {
-		ASSERT(vp->fileobject != 0xdeadbeefdeadbeef);
-		// This triggers, we actually do overwrite entries.
-		//ASSERT(vp->fileobject == NULL || vp->fileobject == fileobject);
-		vp->fileobject = fileobject;
+	ASSERT(vp);
+	ASSERT(fileobject);
+	if (vp && fileobject) {
+		// find the tree_element for the fileobject
+		fo_tree_elem *tree_elem = (fo_tree_elem*)avl_first(&vp->fileobjects);
+		if (tree_elem->fp != fileobject) {
+			while (tree_elem && tree_elem->fp != fileobject)
+				tree_elem = AVL_NEXT(&vp->fileobjects, tree_elem);
+		} 
+
+		if (tree_elem) {
+			// we found something so delete that
+			avl_remove(&vp->fileobjects, tree_elem);
+			kmem_free(tree_elem, sizeof(fo_tree_elem));
+		}
 	}
 }
 
-FILE_OBJECT *vnode_fileobject(vnode_t *vp)
+/*
+* Add filobject to vp->fileobjects
+*/
+void vnode_setfileobject(vnode_t *vp, FILE_OBJECT *fileobject)
 {
-	if (vp) return vp->fileobject;
+	ASSERT(vp);
+	ASSERT(fileobject);
+	if (vp && fileobject) {
+		// find out if the fileobject already exists in the tree
+		FILE_OBJECT *fo = NULL;
+		do {
+			fo = vnode_fileobject(vp, fo);
+			if (fo == fileobject) return;
+		} while (fo != NULL);
+
+		// if we came here, we can safely add the fileobject
+		fo_tree_elem *tree_elem = (fo_tree_elem*)kmem_zalloc(sizeof(fo_tree_elem), KM_SLEEP);
+		tree_elem->fp = fileobject;
+		avl_add(&vp->fileobjects, tree_elem);
+	}
+}
+
+/*
+* Find FILE_OBJECT in vp->fileobjects avl_tree. 
+* If entry==NULL the function will return the first element in the tree.
+* If entry is provided, the function will return the next element after entry. If entry is the last entry in the tree, 
+* the function will return NULL.
+* Iterate through the tree like that:
+*
+*		FILE_OBJECT *fo = NULL;
+*		do { 
+*			fo = vnode_fileobject(vp, fo);
+*		} while (fo != NULL);
+*
+* vp:		vnode containing the avl_tree
+* entry:	optional starting point for searching
+*/
+
+FILE_OBJECT *vnode_fileobject(vnode_t *vp, FILE_OBJECT *entry)
+{
+	ASSERT(vp);
+	dprintf("%s: lookup fileobject for vp %p", __func__, vp);
+	if (vp) {
+		if (avl_is_empty(&vp->fileobjects)) {
+			return NULL;
+		} else {
+			// there is something in the tree, find out what it is
+			// grab first element in tree
+			fo_tree_elem *tree_elem = (fo_tree_elem*)avl_first(&vp->fileobjects);
+			if (entry == NULL) { 
+				// we got no entry, just returned first
+				return tree_elem->fp;
+			} else { 
+				// we got an entry point, so find the next element after entry
+				while (tree_elem && tree_elem->fp != entry)
+					tree_elem = AVL_NEXT(&vp->fileobjects, tree_elem);
+
+				if (tree_elem) { 
+					// we found the avl tree element entry, so grab next element and return
+					fo_tree_elem *next = (fo_tree_elem*)AVL_NEXT(&vp->fileobjects, tree_elem);
+					return next ? next->fp : NULL;
+				} else {
+					// entry was not found in tree 
+					return NULL; 
+				}
+			}
+		}
+	}
 	return NULL;
 }
 
 void vnode_couplefileobject(vnode_t *vp, FILE_OBJECT *fileobject) {
-	
-	if (fileobject)
-		fileobject->FsContext = vp;
-
+	char buf[PATH_MAX] = "";
+	if(fileobject->FileName.Buffer)
+		wcstombs(buf, fileobject->FileName.Buffer, fileobject->FileName.MaximumLength);
+	dprintf("%s: vp %p fileobject %p name %s\n", __func__, vp, fileobject, buf);
+	fileobject->FsContext = vp;
 	vnode_setfileobject(vp, fileobject);
 }
 
 void vnode_decouplefileobject(vnode_t *vp, FILE_OBJECT *fileobject) {
-	if(fileobject)
-		fileobject->FsContext = NULL;
-	vnode_setfileobject(vp, NULL);
+	char buf[PATH_MAX] = "";
+	if (fileobject->FileName.Buffer)
+		wcstombs(buf, fileobject->FileName.Buffer, fileobject->FileName.MaximumLength);
+	dprintf("%s: vp %p fileobject %p name %s\n", __func__, vp, fileobject, buf);
+	fileobject->FsContext = NULL;
+	vnode_removefileobject(vp, fileobject);
 }

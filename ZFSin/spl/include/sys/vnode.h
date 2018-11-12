@@ -40,6 +40,7 @@
 #include <sys/cred.h>
 #include <sys/ubc.h>
 #include <sys/stat.h>
+#include <sys/avl.h>
 
 //#include <kern/locks.h>
 #include <crt/fcntl.h>
@@ -83,7 +84,8 @@ struct vnode {
 	FILE_LOCK lock;
 	SECURITY_DESCRIPTOR *security_descriptor;
 	SHARE_ACCESS share_access;
-	FILE_OBJECT *fileobject;
+	///FILE_OBJECT *fileobject;
+	avl_tree_t fileobjects; // Holds all fileobjects get created for our vnode
 
 	list_node_t v_list; // vnode_all_list member node.
 };
@@ -419,19 +421,21 @@ static inline int win_has_cached_data(struct vnode *vp)
 		vp->FileHeader.AllocationSize.QuadPart = P2ROUNDUP((sz), PAGE_SIZE); \
 		vp->FileHeader.FileSize.QuadPart = (sz); \
 		vp->FileHeader.ValidDataLength.QuadPart = (sz); \
-		PFILE_OBJECT fileObject = vnode_fileobject(vp); \
-        if (fileObject != NULL && \
-		 (ObReferenceObjectByPointer(fileObject,STANDARD_RIGHTS_REQUIRED,NULL,KernelMode) == STATUS_SUCCESS)) { \
-			if (CcIsFileCached(fileObject)) { \
-				CC_FILE_SIZES ccfs; \
-				ccfs.AllocationSize = vp->FileHeader.AllocationSize; \
-				ccfs.FileSize = vp->FileHeader.FileSize; \
-				ccfs.ValidDataLength = vp->FileHeader.ValidDataLength; \
-				CcSetFileSizes(fileObject, &ccfs); \
+		PFILE_OBJECT fileObject = vnode_fileobject(vp, NULL); \
+        while(fileObject) { \
+			if (ObReferenceObjectByPointer(fileObject,STANDARD_RIGHTS_REQUIRED,NULL,KernelMode) == STATUS_SUCCESS) { \
+				if (CcIsFileCached(fileObject)) { \
+					CC_FILE_SIZES ccfs; \
+					ccfs.AllocationSize = vp->FileHeader.AllocationSize; \
+					ccfs.FileSize = vp->FileHeader.FileSize; \
+					ccfs.ValidDataLength = vp->FileHeader.ValidDataLength; \
+					CcSetFileSizes(fileObject, &ccfs); \
+				} \
+				ObDereferenceObject(fileObject); \
 			} \
-			ObDereferenceObject(fileObject); \
+			fileObject = vnode_fileobject(vp, fileObject); \
 		} \
-	} while(0)
+	} while(0);
 #endif
 
 #define vn_ismntpt(vp)   (vnode_mountedhere(vp) != NULL)
@@ -510,9 +514,10 @@ void *vnode_sectionpointer(vnode_t *vp);
 void *vnode_security(vnode_t *vp);
 void vnode_setsecurity(vnode_t *vp, void *sd);
 void vnode_setfileobject(vnode_t *vp, FILE_OBJECT *fileobject);
+void vnode_removefileobject(vnode_t *vp, FILE_OBJECT *fileobject);
 void vnode_couplefileobject(vnode_t *vp, FILE_OBJECT *fileobject);
 void vnode_decouplefileobject(vnode_t *vp, FILE_OBJECT *fileobject);
-FILE_OBJECT *vnode_fileobject(vnode_t *vp);
+FILE_OBJECT *vnode_fileobject(vnode_t *vp, FILE_OBJECT *entry);
 
 #define VNODE_READDIR_EXTENDED 1
 

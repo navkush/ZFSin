@@ -1041,7 +1041,7 @@ int zfs_vnop_lookup(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo)
 				Irp->IoStatus.Information = FILE_OVERWRITTEN;
 				zp->z_pflags |= ZFS_ARCHIVE;
 				// zfs_freesp() path uses vnode_pager_setsize() so we need to make sure fileobject is set.
-				vnode_setfileobject(vp, FileObject);
+				vnode_couplefileobject(vp, FileObject);
 				zfs_freesp(zp, 0, 0, FWRITE, B_TRUE);
 				// Did they ask for an AllocationSize
 				if (Irp->Overlay.AllocationSize.QuadPart > 0) {
@@ -1088,12 +1088,12 @@ int zfs_vnop_reclaim(struct vnode *vp)
 		ExFreePool(sd);
 	vnode_setsecurity(vp, NULL);
 
-	FILE_OBJECT *fileobject = vnode_fileobject(vp);
+	/*FILE_OBJECT *fileobject = vnode_fileobject(vp);
 	if (fileobject != NULL) {
 		vnode_decouplefileobject(vp, fileobject);
 		dprintf("%s: setting FsContext to NULL\n", __func__);
 		fileobject = NULL;
-	}
+	}*/
 
 	// Decouple the nodes
 	ZTOV(zp) = NULL;
@@ -3382,7 +3382,7 @@ NTSTATUS set_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATI
 			struct vnode *vp = IrpSp->FileObject->FsContext;
 			VN_HOLD(vp);
 			// zfs_freesp() path uses vnode_pager_setsize() so we need to make sure fileobject is set.
-			vnode_setfileobject(vp, IrpSp->FileObject);
+			vnode_couplefileobject(vp, IrpSp->FileObject);
 			znode_t *zp = VTOZ(vp);
 			zfsvfs_t *zfsvfs = zp->z_zfsvfs;
 			if (zfsvfs) {
@@ -3651,7 +3651,7 @@ NTSTATUS fs_write(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpS
 	ASSERT(ZTOV(zp) == vp);
 
 	// zfs_write() path uses vnode_pager_setsize() so we need to make sure fileobject is set.
-	vnode_setfileobject(vp, fileObject);
+	vnode_couplefileobject(vp, fileObject);
 
 	if (IrpSp->Parameters.Write.ByteOffset.LowPart == FILE_USE_FILE_POINTER_POSITION &&
 		IrpSp->Parameters.Write.ByteOffset.HighPart == -1) {
